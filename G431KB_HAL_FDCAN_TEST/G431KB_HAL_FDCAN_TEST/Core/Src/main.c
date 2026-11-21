@@ -21,7 +21,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <opencrank/j1939.h>
+#include <opencrank/machine_ctrl.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -45,11 +46,9 @@ FDCAN_HandleTypeDef hfdcan1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-FDCAN_TxHeaderTypeDef TxHeader;
-FDCAN_RxHeaderTypeDef RxHeader;
-uint8_t TxData[8] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
-uint8_t RxData[8];
-
+#define MC_PERIOD_MS 10U   /* TSC1 and pump command every 10 ms */
+static McCtx mc;
+static uint32_t tx_dropped;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -58,12 +57,58 @@ static void MX_GPIO_Init(void);
 static void MX_FDCAN1_Init(void);
 static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
-
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void can_poll_rx(uint32_t now_ms)
+ {
+     FDCAN_RxHeaderTypeDef rx;
+     uint8_t d[8];
 
+     /* Drain the FIFO: one frame per loop would lose frames at 100 frames/s+ */
+     while (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) > 0U) {
+         if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &rx, d) != HAL_OK) {
+             break;
+         }
+         if (rx.IdType != FDCAN_EXTENDED_ID) {
+             continue;                       /* J1939 is 29-bit only */
+         }
+         /* G4: DataLength is the byte count. (On H7 it is shifted 16 bits.) */
+         uint32_t len = rx.DataLength;
+         if (len > 8U) {
+             continue;
+         }
+         J1939Frame f;
+         f.id  = rx.Identifier & 0x1FFFFFFFU;
+         f.dlc = (uint8_t)len;
+         for (uint32_t i = 0U; i < 8U; i++) {
+             f.data[i] = (i < len) ? d[i] : 0xFFU;
+         }
+         mc_handle_frame(&mc, &f, now_ms);
+     }
+ }
+
+ static void can_send(const J1939Frame *f)
+ {
+     if (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0U) {
+         tx_dropped++;                       /* count it; never block */
+         return;
+     }
+     FDCAN_TxHeaderTypeDef tx = {0};
+     tx.Identifier          = f->id;
+     tx.IdType              = FDCAN_EXTENDED_ID;
+     tx.TxFrameType         = FDCAN_DATA_FRAME;
+     tx.DataLength          = f->dlc;        /* G4: plain byte count */
+     tx.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+     tx.BitRateSwitch       = FDCAN_BRS_OFF;
+     tx.FDFormat            = FDCAN_CLASSIC_CAN;
+     tx.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
+     tx.MessageMarker       = 0U;
+     uint8_t d[8];
+     for (uint32_t i = 0U; i < 8U; i++) { d[i] = f->data[i]; }
+     (void)HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &tx, d);
+ }
 /* USER CODE END 0 */
 
 /**
@@ -98,39 +143,44 @@ int main(void)
   MX_FDCAN1_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-  // 1. Configurar filtro global para aceptar todos los mensajes sin filtros específicos por ahora
-  HAL_FDCAN_ConfigGlobalFilter(&hfdcan1, FDCAN_ACCEPT_IN_RX_FIFO0, FDCAN_ACCEPT_IN_RX_FIFO0, FDCAN_FILTER_REMOTE, FDCAN_FILTER_REMOTE);
 
-  // 2. Arrancar el periférico FDCAN
-  if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK)
+  /* Accept every frame into RX FIFO 0: the controller decides what it needs. */
+  if (HAL_FDCAN_ConfigGlobalFilter(&hfdcan1, FDCAN_ACCEPT_IN_RX_FIFO0, FDCAN_ACCEPT_IN_RX_FIFO0,
+                                   FDCAN_FILTER_REMOTE, FDCAN_FILTER_REMOTE) != HAL_OK)
   {
-      Error_Handler();
+    Error_Handler();
   }
 
-  // 3. Configurar la estructura del mensaje que vas a enviar
-  TxHeader.Identifier = 0x123;                  // El ID que verás en candump
-  TxHeader.IdType = FDCAN_STANDARD_ID;
-  TxHeader.TxFrameType = FDCAN_DATA_FRAME;
-  TxHeader.DataLength = FDCAN_DLC_BYTES_8;      // 8 bytes de datos
-  TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-  TxHeader.BitRateSwitch = FDCAN_BRS_OFF;       // Modo clásico (sin cambio de velocidad)
-  TxHeader.FDFormat = FDCAN_CLASSIC_CAN;        // Modo clásico coincidiendo con CubeMX
-  TxHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
-  TxHeader.MessageMarker = 0;
+  if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  mc_init(&mc, &MC_DEFAULT_PARAMS);
+  uint32_t next = HAL_GetTick() + MC_PERIOD_MS;
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  	// Enviar el mensaje al buffer de transmisión
-	    HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &TxHeader, TxData);
+    const uint32_t now = HAL_GetTick();
 
-	    // Cambiar el estado del LED integrado de la Nucleo para saber que el código corre
-	    HAL_GPIO_TogglePin(LED_USER_GPIO_Port, LED_USER_Pin);
+    can_poll_rx(now);
 
-	    // Esperar 1 segundo
-	    HAL_Delay(1000);
+    /* Wrap-safe: true once `now` has reached `next`. */
+    if ((int32_t)(now - next) >= 0)
+    {
+      next += MC_PERIOD_MS;
+
+      J1939Frame out[4];
+      const size_t n = mc_step(&mc, now, out, sizeof(out) / sizeof(out[0]));
+      for (size_t k = 0U; k < n; k++)
+      {
+        can_send(&out[k]);
+      }
+    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -203,13 +253,13 @@ static void MX_FDCAN1_Init(void)
   hfdcan1.Init.ClockDivider = FDCAN_CLOCK_DIV1;
   hfdcan1.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
   hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
-  hfdcan1.Init.AutoRetransmission = DISABLE;
+  hfdcan1.Init.AutoRetransmission = ENABLE;
   hfdcan1.Init.TransmitPause = DISABLE;
   hfdcan1.Init.ProtocolException = DISABLE;
   hfdcan1.Init.NominalPrescaler = 17;
   hfdcan1.Init.NominalSyncJumpWidth = 1;
-  hfdcan1.Init.NominalTimeSeg1 = 15;
-  hfdcan1.Init.NominalTimeSeg2 = 4;
+  hfdcan1.Init.NominalTimeSeg1 = 34;
+  hfdcan1.Init.NominalTimeSeg2 = 5;
   hfdcan1.Init.DataPrescaler = 1;
   hfdcan1.Init.DataSyncJumpWidth = 1;
   hfdcan1.Init.DataTimeSeg1 = 1;
